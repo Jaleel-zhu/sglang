@@ -27,12 +27,6 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe import fused_moe
-from vllm.model_executor.layers.linear import (
-    QKVParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
@@ -40,13 +34,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.dbrx import DbrxConfig
 
+from sglang.srt.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import set_weight_attrs
 
 
 class DbrxRouter(nn.Module):
@@ -250,14 +249,14 @@ class DbrxAttention(nn.Module):
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.Wqkv(hidden_states)
         if self.clip_qkv is not None:
             qkv.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(position_ids, q, k)
-        attn_output = self.attn(q, k, v, input_metadata)
+        attn_output = self.attn(q, k, v, forward_batch)
         hidden_states, _ = self.out_proj(attn_output)
         return hidden_states
 
@@ -279,14 +278,14 @@ class DbrxFusedNormAttention(nn.Module):
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm_1(hidden_states)
         x = self.attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
         hidden_states = residual + x
         residual = hidden_states
@@ -311,12 +310,12 @@ class DbrxBlock(nn.Module):
         self,
         position_ids: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states, residual = self.norm_attn_norm(
             position_ids=position_ids,
             hidden_states=hidden_states,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
         hidden_states = self.ffn(hidden_states)
         hidden_states = hidden_states + residual
@@ -350,7 +349,7 @@ class DbrxModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
@@ -359,7 +358,7 @@ class DbrxModel(nn.Module):
             hidden_states = input_embeds
         for i in range(len(self.blocks)):
             block = self.blocks[i]
-            hidden_states = block(position_ids, hidden_states, input_metadata)
+            hidden_states = block(position_ids, hidden_states, forward_batch)
         hidden_states = self.norm_f(hidden_states)
         return hidden_states
 
@@ -383,21 +382,18 @@ class DbrxForCausalLM(nn.Module):
             padding_size=DEFAULT_VOCAB_PADDING_SIZE,
         )
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, input_metadata)
-        logits_output = self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+        hidden_states = self.transformer(input_ids, positions, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        return sample_output, logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = [

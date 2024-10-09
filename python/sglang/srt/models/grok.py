@@ -28,12 +28,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.model_executor.layers.linear import (
-    QKVParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -44,10 +38,15 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.fused_moe import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class Grok1MoE(nn.Module):
@@ -174,12 +173,12 @@ class Grok1Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, input_metadata)
+        attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -220,7 +219,7 @@ class Grok1DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # Self Attention
         hidden_states = (
@@ -228,7 +227,7 @@ class Grok1DecoderLayer(nn.Module):
                 self.self_attn(
                     positions=positions,
                     hidden_states=self.pre_attn_norm(hidden_states),
-                    input_metadata=input_metadata,
+                    forward_batch=forward_batch,
                 )
             )
             + hidden_states
@@ -269,7 +268,7 @@ class Grok1Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if input_embeds is None:
@@ -279,7 +278,7 @@ class Grok1Model(nn.Module):
             hidden_states = input_embeds
 
         for i in range(len(self.layers)):
-            hidden_states = self.layers[i](positions, hidden_states, input_metadata)
+            hidden_states = self.layers[i](positions, hidden_states, forward_batch)
         hidden_states = self.norm(hidden_states)
         hidden_states.mul_(self.config.output_multiplier_scale)
         return hidden_states
@@ -298,7 +297,6 @@ class Grok1ForCausalLM(nn.Module):
         self.model = Grok1Model(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
         # Monkey patch _prepare_weights to load pre-sharded weights
         setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
@@ -311,15 +309,13 @@ class Grok1ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
-        logits_output = self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        return sample_output, logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

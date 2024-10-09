@@ -24,12 +24,6 @@ from torch import nn
 from torch.nn import LayerNorm
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -40,10 +34,15 @@ from vllm.transformers_utils.configs import ChatGLMConfig
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 LoraConfig = None
 
@@ -119,7 +118,7 @@ class GLMAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -128,7 +127,7 @@ class GLMAttention(nn.Module):
             q,
             k,
             v,
-            input_metadata,
+            forward_batch,
         )
         attn_output, _ = self.dense(context_layer)
         return attn_output
@@ -221,7 +220,7 @@ class GLMBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # hidden_states: [num_tokens, h]
         # Layer norm at the beginning of the transformer layer.
@@ -230,7 +229,7 @@ class GLMBlock(nn.Module):
         attention_output = self.self_attention(
             hidden_states=layernorm_output,
             position_ids=position_ids,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
 
         # Residual connection.
@@ -289,14 +288,14 @@ class GLMTransformer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         for i in range(self.num_layers):
             layer = self.layers[i]
             hidden_states = layer(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
-                input_metadata=input_metadata,
+                forward_batch=forward_batch,
             )
         # Final layer norm.
         if self.post_layer_norm:
@@ -329,7 +328,7 @@ class ChatGLMModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         inputs_embeds = self.embedding(input_ids)
 
@@ -337,7 +336,7 @@ class ChatGLMModel(nn.Module):
         hidden_states = self.encoder(
             hidden_states=inputs_embeds,
             position_ids=position_ids,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
         return hidden_states
 
@@ -371,21 +370,18 @@ class ChatGLMForCausalLM(nn.Module):
         self.transformer = ChatGLMModel(config, cache_config, quant_config)
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, input_metadata)
-        logits_output = self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+        hidden_states = self.transformer(input_ids, positions, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        return sample_output, logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))

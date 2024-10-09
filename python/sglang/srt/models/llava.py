@@ -32,28 +32,25 @@ from transformers import (
 )
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 from vllm.config import CacheConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
     unpad_image_shape,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 
 
 class LlavaBaseForCausalLM(nn.Module):
-    def pad_input_ids(
-        self,
-        input_ids: List[int],
-        pad_value: List[int],
-        pixel_values: List,
-        image_sizes: List[List[int]],
-    ):
+    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
+        image_sizes, pad_values = image_inputs.image_sizes, image_inputs.pad_values
+
         # hardcode for spatial_unpad + anyres
         image_aspect_ratio = "anyres" if len(image_sizes) == 1 else "pad"
         offset_list = []
@@ -92,8 +89,8 @@ class LlavaBaseForCausalLM(nn.Module):
                         new_w = int(new_w // times)
                 new_image_feature_len += new_h * (new_w + 1)
 
-            pad_ids = pad_value * (
-                (new_image_feature_len + len(pad_value)) // len(pad_value)
+            pad_ids = pad_values * (
+                (new_image_feature_len + len(pad_values)) // len(pad_values)
             )
             # print("calculated new_image_feature_len: ", new_image_feature_len)
             try:
@@ -107,7 +104,9 @@ class LlavaBaseForCausalLM(nn.Module):
                 + input_ids[offset + 1 :]
             )
             offset_list.append(offset)
-        return input_ids, offset_list
+
+        image_inputs.image_offsets = offset_list
+        return input_ids
 
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
         image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
@@ -131,27 +130,40 @@ class LlavaBaseForCausalLM(nn.Module):
         self,
         input_ids: torch.LongTensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
-        pixel_values: Optional[List[Optional[np.array]]] = None,
-        image_sizes: Optional[List[List[int]]] = None,
-        image_offsets: Optional[List[int]] = None,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if input_metadata.forward_mode == ForwardMode.EXTEND:
-            bs = input_metadata.batch_size
+        image_inputs = forward_batch.image_inputs
+
+        if forward_batch.forward_mode.is_extend():
+            bs = forward_batch.batch_size
+            # Got List[List[str]] extend it to List[str]
+            # The length of the List should be equal to batch size
+            modalities_list = []
+            max_image_offset = []
+            for im in image_inputs:
+                if im and im.modalities is not None:
+                    modalities_list.extend(im.modalities)
+                if im and im.image_offsets is not None:
+                    max_image_offset.append(max(im.image_offsets))
+                else:
+                    max_image_offset.append(-1)
 
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
-            # Whether the requests need vision inputs
-            max_image_offset = np.array(
-                [max(image_offsets[i]) if image_offsets[i] else -1 for i in range(bs)]
-            )
-            start_positions = positions[input_metadata.extend_start_loc].cpu().numpy()
-            need_vision = start_positions <= max_image_offset
+            start_positions = positions[forward_batch.extend_start_loc].cpu().numpy()
+            need_vision = start_positions <= np.array(max_image_offset)
 
             if need_vision.any():
-                pixel_values = [pixel_values[i] for i in range(bs) if need_vision[i]]
-                image_sizes = [image_sizes[i] for i in range(bs) if need_vision[i]]
+                pixel_values = [
+                    image_inputs[i].pixel_values for i in range(bs) if need_vision[i]
+                ]
+                image_sizes = [
+                    image_inputs[i].image_sizes for i in range(bs) if need_vision[i]
+                ]
+                image_offsets = [
+                    image_inputs[i].image_offsets for i in range(bs) if need_vision[i]
+                ]
 
                 ########## Encode Image ########
 
@@ -179,11 +191,14 @@ class LlavaBaseForCausalLM(nn.Module):
                     new_image_features = []
                     height = width = self.num_patches_per_side
                     for image_idx, image_feature in enumerate(image_features):
-                        if len(image_sizes[image_idx]) == 1:
+                        if modalities_list[image_idx] == "image":
                             image_aspect_ratio = (
                                 self.config.image_aspect_ratio
                             )  # single image
-                        else:
+                        elif (
+                            modalities_list[image_idx] == "multi-images"
+                            or modalities_list[image_idx] == "video"
+                        ):
                             image_aspect_ratio = "pad"  # multi image
                         # image_aspect_ratio = (
                         #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
@@ -191,6 +206,7 @@ class LlavaBaseForCausalLM(nn.Module):
                         if (
                             image_feature.shape[0] > 1
                             and "anyres" in image_aspect_ratio
+                            and modalities_list[image_idx] == "image"
                         ):
                             base_image_feature = image_feature[0]
                             image_feature = image_feature[1:]
@@ -290,7 +306,7 @@ class LlavaBaseForCausalLM(nn.Module):
                             )
                             image_feature = image_feature.unsqueeze(0)
                         else:
-                            if image_feature.shape[0] > 16:  # video
+                            if modalities_list[image_idx] == "video":  # video
                                 # 2x2 pooling
                                 num_of_frames = image_feature.shape[0]
                                 image_feature = image_feature.view(
@@ -312,13 +328,28 @@ class LlavaBaseForCausalLM(nn.Module):
                                     .transpose(1, 2)
                                     .contiguous()
                                 )  # N, C, H*W
+                            if "unpad" in self.mm_patch_merge_type:
+                                image_feature = torch.cat(
+                                    (
+                                        image_feature,
+                                        # Expand to (bs, 1, hidden_dim) and concat at the end of the image tokens
+                                        self.language_model.model.image_newline[
+                                            None, None
+                                        ].expand(
+                                            image_feature.shape[0],
+                                            1,
+                                            image_feature.shape[-1],
+                                        ),
+                                    ),
+                                    dim=1,
+                                )
 
                         new_image_features.append(image_feature)
                     image_features = new_image_features
 
                 # Fill in the placeholder for the image
-                extend_start_loc_cpu = input_metadata.extend_start_loc.cpu().numpy()
-                prefix_lens_cpu = input_metadata.extend_prefix_lens.cpu().numpy()
+                extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
+                prefix_lens_cpu = forward_batch.extend_prefix_lens.cpu().numpy()
                 pt = 0
                 for i in range(bs):
                     if not need_vision[i]:
@@ -348,10 +379,10 @@ class LlavaBaseForCausalLM(nn.Module):
                     pt += 1
 
             return self.language_model(
-                input_ids, positions, input_metadata, input_embeds=input_embeds
+                input_ids, positions, forward_batch, input_embeds=input_embeds
             )
-        elif input_metadata.forward_mode == ForwardMode.DECODE:
-            return self.language_model(input_ids, positions, input_metadata)
+        elif forward_batch.forward_mode.is_decode():
+            return self.language_model(input_ids, positions, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Load clip vision model by cfg['mm_vision_tower']:

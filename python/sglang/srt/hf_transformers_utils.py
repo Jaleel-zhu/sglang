@@ -16,11 +16,9 @@ limitations under the License.
 """Utilities for Huggingface Transformers."""
 
 import contextlib
-import functools
-import json
 import os
 import warnings
-from typing import AbstractSet, Collection, Dict, List, Literal, Optional, Type, Union
+from typing import Dict, Optional, Type, Union
 
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -131,6 +129,7 @@ def get_tokenizer(
             *args,
             trust_remote_code=trust_remote_code,
             tokenizer_revision=tokenizer_revision,
+            clean_up_tokenization_spaces=False,
             **kwargs,
         )
     except TypeError as e:

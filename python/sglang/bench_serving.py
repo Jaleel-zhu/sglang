@@ -2,7 +2,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/6366efc67b0aedd2c1721c14385370e50b297fb3/benchmarks/benchmark_serving.py
 
 """
-Benchmark online serving.
+Benchmark online serving with dynamic requests.
 
 Usage:
 python3 -m sglang.bench_serving --backend sglang --num-prompt 10
@@ -298,34 +298,41 @@ class BenchmarkMetrics:
     median_e2e_latency_ms: float
 
 
-default_sharegpt_path = "ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
 
 
-def download_sharegpt_dataset(path):
-    url = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+def download_and_cache_file(url: str, filename: Optional[str] = None):
+    """Read and cache a file from a url."""
+    if filename is None:
+        filename = os.path.join("/tmp", url.split("/")[-1])
 
-    print(f"Downloading dataset from {url}")
-    try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
+    # Check if the cache file already exists
+    if os.path.exists(filename):
+        return filename
 
-        total_size = int(response.headers.get("content-length", 0))
-        block_size = 8192
+    print(f"Downloading from {url} to {filename}")
 
-        with open(path, "wb") as f, tqdm(
-            desc="Downloading",
-            total=total_size,
-            unit="iB",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as progress_bar:
-            for data in response.iter_content(block_size):
-                size = f.write(data)
-                progress_bar.update(size)
+    # Stream the response to show the progress bar
+    response = requests.get(url, stream=True)
+    response.raise_for_status()  # Check for request errors
 
-        print(f"Dataset downloaded and saved to {path}")
-    except requests.RequestException as e:
-        raise Exception(f"Failed to download dataset: {e}")
+    # Total size of the file in bytes
+    total_size = int(response.headers.get("content-length", 0))
+    chunk_size = 1024  # Download in chunks of 1KB
+
+    # Use tqdm to display the progress bar
+    with open(filename, "wb") as f, tqdm(
+        desc=filename,
+        total=total_size,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as bar:
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            f.write(chunk)
+            bar.update(len(chunk))
+
+    return filename
 
 
 def sample_sharegpt_requests(
@@ -338,13 +345,8 @@ def sample_sharegpt_requests(
         raise ValueError("output_len too small")
 
     # Download sharegpt if necessary
-    if not os.path.isfile(dataset_path) and not os.path.isfile(default_sharegpt_path):
-        download_sharegpt_dataset(default_sharegpt_path)
-        dataset_path = default_sharegpt_path
-    else:
-        dataset_path = (
-            dataset_path if os.path.isfile(dataset_path) else default_sharegpt_path
-        )
+    if not os.path.isfile(dataset_path):
+        dataset_path = download_and_cache_file(SHAREGPT_URL)
 
     # Load the dataset.
     with open(dataset_path) as f:
@@ -412,15 +414,8 @@ def sample_random_requests(
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
-        if not os.path.isfile(dataset_path) and not os.path.isfile(
-            default_sharegpt_path
-        ):
-            download_sharegpt_dataset(default_sharegpt_path)
-            dataset_path = default_sharegpt_path
-        else:
-            dataset_path = (
-                dataset_path if os.path.isfile(dataset_path) else default_sharegpt_path
-            )
+        if not os.path.isfile(dataset_path):
+            dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         # Load the dataset.
         with open(dataset_path) as f:
@@ -850,6 +845,7 @@ def run_benchmark(args_: argparse.Namespace):
     tokenizer = get_tokenizer(tokenizer_id)
 
     if args.dataset_name == "sharegpt":
+        assert args.random_input_len is None and args.random_output_len is None
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -857,6 +853,7 @@ def run_benchmark(args_: argparse.Namespace):
             fixed_output_len=args.sharegpt_output_len,
         )
     elif args.dataset_name == "random":
+        assert args.random_input_len is not None and args.random_output_len is not None
         input_requests = sample_random_requests(
             input_len=args.random_input_len,
             output_len=args.random_output_len,
@@ -969,13 +966,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--random-input-len",
         type=int,
-        default=1024,
         help="Number of input tokens per request, used only for random dataset.",
     )
     parser.add_argument(
         "--random-output-len",
         type=int,
-        default=128,
         help="Number of output tokens per request, used only for random dataset.",
     )
     parser.add_argument(

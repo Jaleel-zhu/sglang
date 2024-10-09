@@ -50,22 +50,21 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.model_executor.layers.linear import (
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.utils import set_weight_attrs
-
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import set_weight_attrs
 
 
 @torch.compile
@@ -221,14 +220,14 @@ class CohereAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
             q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, input_metadata)
+        attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -256,7 +255,7 @@ class CohereDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
@@ -265,7 +264,7 @@ class CohereDecoderLayer(nn.Module):
         hidden_states_attention = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
         hidden_states_mlp = self.mlp(hidden_states)
         # Add everything together
@@ -300,7 +299,7 @@ class CohereModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
@@ -309,7 +308,7 @@ class CohereModel(nn.Module):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                input_metadata,
+                forward_batch,
                 residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -327,7 +326,6 @@ class CohereForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
         self.model = CohereModel(config, quant_config)
 
     @torch.no_grad()
@@ -335,18 +333,16 @@ class CohereForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids,
             positions,
-            input_metadata,
+            forward_batch,
         )
-        logits_output = self.logits_processor(
-            input_ids, hidden_states, self.model.embed_tokens.weight, input_metadata
+        return self.logits_processor(
+            input_ids, hidden_states, self.model.embed_tokens.weight, forward_batch
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        return sample_output, logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

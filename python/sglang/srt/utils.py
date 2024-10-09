@@ -16,17 +16,19 @@ limitations under the License.
 """Common utilities."""
 
 import base64
-import fcntl
+import ipaddress
+import json
 import logging
 import os
+import pickle
 import random
 import resource
 import socket
-import struct
 import time
+import warnings
 from importlib.metadata import PackageNotFoundError, version
 from io import BytesIO
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import psutil
@@ -35,7 +37,8 @@ import torch
 import torch.distributed as dist
 from fastapi.responses import JSONResponse
 from packaging import version as pkg_version
-from torch.nn.parameter import Parameter
+from torch import nn
+from torch.profiler import ProfilerActivity, profile, record_function
 from triton.runtime.cache import (
     FileCacheManager,
     default_cache_dir,
@@ -48,6 +51,27 @@ logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
+
+
+def is_hip() -> bool:
+    """Return whether it is HIP on the AMD ROCm platform."""
+    return torch.version.hip is not None
+
+
+def is_flashinfer_available():
+    """
+    Check whether flashinfer is available.
+    As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
+    """
+    return torch.cuda.is_available() and not is_hip()
+
+
+def is_ipv6(address):
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ipaddress.AddressValueError:
+        return False
 
 
 def enable_show_time_cost():
@@ -164,35 +188,6 @@ def is_port_available(port):
             return False
 
 
-def allocate_init_ports(
-    port: Optional[int] = None,
-    additional_ports: Optional[List[int]] = None,
-    dp_size: int = 1,
-):
-    """Allocate ports for all connections."""
-    if additional_ports:
-        ret_ports = [port] + additional_ports
-    else:
-        ret_ports = [port]
-
-    ret_ports = list(set(x for x in ret_ports if is_port_available(x)))
-    cur_port = ret_ports[-1] + 1 if len(ret_ports) > 0 else 10000
-
-    # HTTP + Tokenizer + Controller + Detokenizer + dp_size * 1 (nccl)
-    num_ports_needed = 4 + dp_size
-    while len(ret_ports) < num_ports_needed:
-        if cur_port not in ret_ports and is_port_available(cur_port):
-            ret_ports.append(cur_port)
-        cur_port += 1
-
-    if port is not None and ret_ports[0] != port:
-        logger.warn(
-            f"WARNING: Port {port} is not available. Use port {ret_ports[0]} instead."
-        )
-
-    return ret_ports[0], ret_ports[1:num_ports_needed]
-
-
 def is_multimodal_model(model_architectures):
     if (
         "LlavaLlamaForCausalLM" in model_architectures
@@ -213,6 +208,8 @@ def is_generation_model(model_architectures, is_embedding: bool = False):
     if (
         "LlamaEmbeddingModel" in model_architectures
         or "MistralModel" in model_architectures
+        or "LlamaForSequenceClassification" in model_architectures
+        or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
     ):
         return False
     else:
@@ -338,6 +335,10 @@ def suppress_other_loggers():
     )
     logging.getLogger("vllm.selector").setLevel(logging.WARN)
     logging.getLogger("vllm.utils").setLevel(logging.ERROR)
+
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
@@ -531,89 +532,6 @@ class CustomCacheManager(FileCacheManager):
                 raise RuntimeError("Could not create or locate cache dir")
 
 
-def get_ip_address(ifname):
-    """
-    Get the IP address of a network interface.
-
-    :param ifname: Name of the network interface (e.g., 'eth0')
-    :return: IP address of the network interface
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ip_address = fcntl.ioctl(
-        s.fileno(),
-        0x8915,  # SIOCGIFADDR
-        struct.pack("256s", bytes(ifname[:15], "utf-8")),
-    )[20:24]
-    return socket.inet_ntoa(ip_address)
-
-
-def send_addrs_to_rank_0(model_port_args, server_args):
-    assert server_args.node_rank != 0 and server_args.dp_size == 1
-
-    ifname = os.environ.get(
-        "SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0")
-    )
-    ip_addr = get_ip_address(ifname)
-
-    num_tp_ports = server_args.tp_size // server_args.nnodes
-    model_port_args.model_tp_ips[:num_tp_ports] = [ip_addr] * num_tp_ports
-    ip_addr = [int(x) for x in ip_addr.split(".")]
-    addrs_tensor = torch.tensor(
-        ip_addr + model_port_args.model_tp_ports, dtype=torch.int
-    )
-
-    init_method = f"tcp://{server_args.nccl_init_addr}"
-    dist.init_process_group(
-        backend="gloo",
-        init_method=init_method,
-        rank=server_args.node_rank,
-        world_size=server_args.nnodes,
-    )
-    dist.send(addrs_tensor, dst=0)
-    print(
-        f"Node {server_args.node_rank} sent: ip_address {ip_addr} and ports {model_port_args.model_tp_ports}"
-    )
-
-    dist.barrier()
-    dist.destroy_process_group()
-
-
-def receive_addrs(model_port_args, server_args):
-    assert server_args.node_rank == 0 and server_args.dp_size == 1
-
-    ifname = os.environ.get(
-        "SGLANG_SOCKET_IFNAME", os.environ.get("NCCL_SOCKET_IFNAME", "eth0")
-    )
-    ip_addr = get_ip_address(ifname)
-
-    num_tp_ports = server_args.tp_size // server_args.nnodes
-    model_port_args.model_tp_ips[:num_tp_ports] = [ip_addr] * num_tp_ports
-
-    init_method = f"tcp://{server_args.nccl_init_addr}"
-    dist.init_process_group(
-        backend="gloo",
-        init_method=init_method,
-        rank=server_args.node_rank,
-        world_size=server_args.nnodes,
-    )
-
-    for src_rank in range(1, server_args.nnodes):
-        tensor = torch.zeros(4 + num_tp_ports, dtype=torch.int)
-        dist.recv(tensor, src=src_rank)
-        ip = ".".join([str(x) for x in tensor[:4].tolist()])
-        ports = tensor[4:].tolist()
-        model_port_args.model_tp_ips[
-            num_tp_ports * src_rank : num_tp_ports * (src_rank + 1)
-        ] = [ip] * num_tp_ports
-        model_port_args.model_tp_ports[
-            num_tp_ports * src_rank : num_tp_ports * (src_rank + 1)
-        ] = ports
-        print(f"Node 0 received from rank {src_rank}: {tensor.tolist()}")
-
-    dist.barrier()
-    dist.destroy_process_group()
-
-
 def set_ulimit(target_soft_limit=65535):
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
@@ -622,56 +540,7 @@ def set_ulimit(target_soft_limit=65535):
         try:
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
-            logger.warn(f"Fail to set RLIMIT_NOFILE: {e}")
-
-
-def is_llama3_405b_fp8_head_16(model_config):
-    """Return whether the model is meta-llama/Meta-Llama-3.1-405B-FP8 with 16 kv heads."""
-    if (
-        model_config.hf_config.architectures[0] == "LlamaForCausalLM"
-        and model_config.hf_config.hidden_size == 16384
-        and model_config.hf_config.intermediate_size == 53248
-        and model_config.hf_config.num_hidden_layers == 126
-        and model_config.hf_config.num_key_value_heads == 16
-        and hasattr(model_config.hf_config, "quantization_config")
-        and model_config.hf_config.quantization_config["quant_method"] == "fbgemm_fp8"
-    ):
-        return True
-    return False
-
-
-def monkey_patch_vllm_qvk_linear_loader():
-    """A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints."""
-    from vllm.model_executor.layers.linear import QKVParallelLinear
-
-    origin_weight_loader = QKVParallelLinear.weight_loader
-
-    def get_original_weight(loaded_weight, head_dim):
-        n_kv_head = loaded_weight.shape[0] // (2 * head_dim)
-        dim = loaded_weight.shape[1]
-        for i in range(n_kv_head):
-            loaded_weight[i * head_dim : (i + 1) * head_dim, :] = loaded_weight[
-                2 * i * head_dim : (2 * i + 1) * head_dim, :
-            ]
-        original_kv_weight = loaded_weight[: n_kv_head * head_dim, :]
-        assert original_kv_weight.shape == (n_kv_head * head_dim, dim)
-        return original_kv_weight
-
-    def weight_loader_srt(
-        self,
-        param: Parameter,
-        loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[str] = None,
-    ):
-        if (
-            loaded_shard_id in ["k", "v"]
-            and loaded_weight.shape[0] == self.head_size * self.total_num_kv_heads * 2
-        ):
-            loaded_weight = get_original_weight(loaded_weight, self.head_size)
-
-        origin_weight_loader(self, param, loaded_weight, loaded_shard_id)
-
-    setattr(QKVParallelLinear, "weight_loader", weight_loader_srt)
+            logger.warning(f"Fail to set RLIMIT_NOFILE: {e}")
 
 
 def add_api_key_middleware(app, api_key: str):
@@ -686,24 +555,16 @@ def add_api_key_middleware(app, api_key: str):
         return await call_next(request)
 
 
-def prepare_model(model_path: str):
+def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
     if "SGLANG_USE_MODELSCOPE" in os.environ:
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
-            return snapshot_download(model_path)
-    return model_path
-
-
-def prepare_tokenizer(tokenizer_path: str):
-    if "SGLANG_USE_MODELSCOPE" in os.environ:
-        if not os.path.exists(tokenizer_path):
-            from modelscope import snapshot_download
-
-            return snapshot_download(
+            model_path = snapshot_download(model_path)
+            tokenizer_path = snapshot_download(
                 tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
             )
-    return tokenizer_path
+    return model_path, tokenizer_path
 
 
 def configure_logger(server_args, prefix: str = ""):
@@ -714,3 +575,103 @@ def configure_logger(server_args, prefix: str = ""):
         datefmt="%H:%M:%S",
         force=True,
     )
+
+
+# source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
+def replace_submodule(
+    model: nn.Module, module_name: str, new_module: nn.Module
+) -> nn.Module:
+    """Replace a submodule in a model with a new module."""
+    parent = model.get_submodule(".".join(module_name.split(".")[:-1]))
+    target_name = module_name.split(".")[-1]
+    setattr(parent, target_name, new_module)
+    return new_module
+
+
+def set_weight_attrs(
+    weight: torch.Tensor,
+    weight_attrs: Optional[Dict[str, Any]],
+):
+    """Set attributes on a weight tensor.
+
+    This method is used to set attributes on a weight tensor. This method
+    will not overwrite existing attributes.
+
+    Args:
+        weight: The weight tensor.
+        weight_attrs: A dictionary of attributes to set on the weight tensor.
+    """
+    if weight_attrs is None:
+        return
+    for key, value in weight_attrs.items():
+        assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
+        setattr(weight, key, value)
+
+
+def broadcast_pyobj(
+    data: List[Any],
+    rank: int,
+    dist_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
+
+    if rank == 0:
+        if len(data) == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long)
+            dist.broadcast(tensor_size, src=0, group=dist_group)
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
+
+            dist.broadcast(tensor_size, src=0, group=dist_group)
+            dist.broadcast(tensor_data, src=0, group=dist_group)
+        return data
+    else:
+        tensor_size = torch.tensor([0], dtype=torch.long)
+        dist.broadcast(tensor_size, src=0, group=dist_group)
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(size, dtype=torch.uint8)
+        dist.broadcast(tensor_data, src=0, group=dist_group)
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+
+step_counter = 0
+
+
+def pytorch_profile(name, func, *args, data_size=-1):
+    """
+    Args:
+        name (string): the name of recorded function.
+        func: the function to be profiled.
+        args: the arguments of the profiled function.
+        data_size (int): some measurement of the computation complexity.
+            Usually, it could be the batch size.
+    """
+    global step_counter
+    os.makedirs("trace", exist_ok=True)
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    ) as prof:
+        with record_function(name):
+            with open(f"trace/size_{step_counter}.json", "w") as f:
+                json.dump({"size": data_size}, f)
+            result = func(*args)
+    prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
+    step_counter += 1
+    return result

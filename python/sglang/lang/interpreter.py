@@ -2,6 +2,7 @@
 
 import asyncio
 import contextvars
+import copy
 import multiprocessing
 import queue
 import threading
@@ -9,7 +10,7 @@ import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import tqdm
 
@@ -434,9 +435,6 @@ class StreamExecutor:
         self.cur_images.append((path, base64_data))
         self.text_ += self.chat_template.image_token
 
-        # if global_config.eager_fill_image:
-        #     self.backend.fill_image(self)
-
     def _spec_gen(self, sampling_params):
         stop = sampling_params.stop
         max_new_tokens = sampling_params.max_new_tokens
@@ -655,9 +653,22 @@ class StreamExecutor:
                 self._init_var_event(e)
 
     def _resolve_sampling_params(self, sampling_params):
-        clone = None
+        """
+        Construct sampling param based on default + override values
+
+        The default values of sampling are populated in `default_sampling_para` via sgl.function.run(...sampling_args)
+        , and `sampling_params` contains the override values from sgl.gen().
+
+        Here we use default_sampling_para as the base and override the values if they exist in `sampling_params`.
+        It also extends the stop tokens based on the chat template.
+        """
+
+        # deepcopy is required because the dict has lists inside
+        clone = copy.deepcopy(self.default_sampling_para)
+
         for item in [
             "max_new_tokens",
+            "min_new_tokens",
             "stop",
             "stop_token_ids",
             "temperature",
@@ -677,20 +688,16 @@ class StreamExecutor:
         ]:
             value = getattr(sampling_params, item, None)
             if value is not None:
-                if clone is None:
-                    clone = self.default_sampling_para.clone()
                 setattr(clone, item, value)
 
         if self.chat_template.stop_str:
-            if not clone:
-                clone = self.default_sampling_para.clone()
             if clone.stop == ():
                 clone.stop = []
             elif isinstance(clone.stop, str):
                 clone.stop = [clone.stop]
             clone.stop += self.chat_template.stop_str
 
-        return clone or self.default_sampling_para
+        return clone
 
     def __del__(self):
         self.end()
