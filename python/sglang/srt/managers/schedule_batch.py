@@ -196,6 +196,9 @@ class Req:
         # this does not include the jump forward tokens.
         self.completion_tokens_wo_jump_forward = 0
 
+        # The number of cached tokens, that were already cached in the KV store
+        self.cached_tokens = 0
+
         # For vision inputs
         self.image_inputs: Optional[ImageInputs] = None
 
@@ -499,6 +502,13 @@ class ScheduleBatch:
 
         pt = 0
         for i, req in enumerate(reqs):
+            already_computed = (
+                req.extend_logprob_start_len + 1 + req.cached_tokens
+                if req.extend_logprob_start_len > 0
+                else 0
+            )
+            req.cached_tokens += len(req.prefix_indices) - already_computed
+
             req.req_pool_idx = req_pool_indices[i]
             pre_len, seq_len = len(req.prefix_indices), len(req.fill_ids)
             seq_lens.append(seq_len)
@@ -527,8 +537,8 @@ class ScheduleBatch:
         # Set fields
         with out_cache_loc.device:
             self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32)
-            self.req_pool_indices = torch.tensor(req_pool_indices)
-            self.seq_lens = torch.tensor(seq_lens)
+            self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int32)
+            self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
 
         self.extend_num_tokens = extend_num_tokens
         self.out_cache_loc = out_cache_loc
@@ -649,7 +659,7 @@ class ScheduleBatch:
             req.last_update_decode_tokens = 0
             req.logprob_start_len = 10**9
 
-        self.filter_batch(sorted_indices)
+        self.filter_batch(keep_indices=sorted_indices)
 
         # Reqs in batch are filtered
         total_decoded_tokens = sum(len(r.output_ids) for r in self.reqs)
@@ -734,16 +744,20 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.DECODE
 
         self.input_ids = self.output_ids
-        self.seq_lens.add_(1)
         self.output_ids = None
+        if self.sampling_info.penalizer_orchestrator:
+            self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                self.input_ids
+            )
 
         # Alloc mem
         bs = len(self.reqs)
         self.out_cache_loc = self.alloc_token_slots(bs)
 
-        self.req_to_token_pool.req_to_token[
-            self.req_pool_indices, self.seq_lens - 1
-        ] = self.out_cache_loc
+        self.req_to_token_pool.req_to_token[self.req_pool_indices, self.seq_lens] = (
+            self.out_cache_loc
+        )
+        self.seq_lens.add_(1)
 
     def filter_batch(
         self,
